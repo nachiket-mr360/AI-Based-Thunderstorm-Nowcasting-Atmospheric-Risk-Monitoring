@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ page_title }}</title>
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <!-- Leaflet (map) and Chart.js (trend charts) from CDN. Both are optional at
+       runtime: the dashboard degrades gracefully if they cannot be loaded. -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js" defer></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+  <script src="{{ url_for('static', filename='dashboard.js') }}" defer></script>
+</head>
+<body>
+  <header class="app-header">
+    <div class="header-main">
+      <div class="header-title">
+        <h1>{{ page_title }}</h1>
+        <p class="header-meta">
+          <span class="badge badge-sih">SIH 2026</span>
+          <span class="dot-sep">&middot;</span>
+          <span>{{ location }}</span>
+          <span class="dot-sep">&middot;</span>
+          <span class="mono">{{ latitude }}&deg; N, {{ longitude }}&deg; E</span>
+        </p>
+      </div>
+      <div class="header-actions">
+        <span id="live-status" class="status-pill status-pending">
+          <span class="status-dot"></span><span id="live-status-text">Connecting&hellip;</span>
+        </span>
+        <button id="refresh-button" type="button" class="btn btn-primary">
+          Refresh Prediction
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <div id="error-banner" class="error-banner" role="alert" aria-live="assertive" hidden>
+    <div class="error-banner-head">
+      <strong>Live weather data is temporarily unavailable. No prediction was generated.</strong>
+    </div>
+    <p id="error-detail" class="error-banner-detail"></p>
+  </div>
+
+  <main>
+    <!-- ================= 2. MAIN RISK CARD ================= -->
+    <section class="card risk-card" aria-live="polite">
+      <div class="risk-head">
+        <h2>AI High-Precipitation Risk Proxy</h2>
+        <span class="risk-head-tags">
+          <span class="mode-chip mode-live">Live Mode</span>
+          <span class="chip">3-Hour Atmospheric Risk Estimate</span>
+        </span>
+      </div>
+
+      <div class="risk-body">
+        <div class="risk-primary">
+          <span id="risk-label" class="risk-label risk-label-empty">&mdash;</span>
+          <span class="risk-sublabel">Current risk classification</span>
+        </div>
+
+        <div class="risk-secondary">
+          <div class="risk-stat">
+            <span class="stat-label">Model probability (Elevated Risk class)</span>
+            <span id="probability" class="stat-value">&mdash;</span>
+            <div class="prob-track"><div id="probability-bar" class="prob-fill"></div></div>
+          </div>
+          <div class="risk-stat">
+            <span class="stat-label">Prediction horizon</span>
+            <span class="stat-value stat-value-sm">Next 3 Hours</span>
+          </div>
+          <div class="risk-stat">
+            <span class="stat-label">Data timestamp (UTC)</span>
+            <span id="observation-timestamp" class="stat-value stat-value-sm">&mdash;</span>
+          </div>
+          <div class="risk-stat">
+            <span class="stat-label">Decision threshold</span>
+            <span id="threshold" class="stat-value stat-value-sm">&mdash;</span>
+          </div>
+        </div>
+      </div>
+
+      <p class="footnote">
+        The probability above is the model's output for the Elevated Risk class. It is not a
+        measure of model accuracy or confidence, and it is not a thunderstorm or lightning
+        probability.
+      </p>
+    </section>
+
+    <!-- ================= 3. CURRENT ATMOSPHERIC CONDITIONS ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Current Atmospheric Conditions</h2>
+        <span id="conditions-note" class="section-note">Live values from Open-Meteo</span>
+      </div>
+      <div id="conditions-grid" class="conditions-grid">
+        <!-- populated by dashboard.js -->
+      </div>
+      <p class="footnote">
+        Values are the latest available hourly atmospheric data at or before the current time,
+        as returned by Open-Meteo. Blank entries mean the upstream source did not provide that
+        value.
+      </p>
+    </section>
+
+    <!-- ================= 4. LOCATION MAP ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Target Observation Location</h2>
+        <span class="section-note">{{ location }}</span>
+      </div>
+      <div id="map" class="map"
+           data-latitude="{{ latitude }}"
+           data-longitude="{{ longitude }}"
+           data-location="{{ location }}"></div>
+      <p class="footnote">
+        Geographic visualization of the target observation location only. The highlighted
+        circle is an approximate locator, and is <strong>not</strong> a forecast grid, a
+        prediction footprint, or 1&nbsp;km-resolution model output.
+      </p>
+    </section>
+
+    <!-- ================= 5. ATMOSPHERIC TREND CHART ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Recent Atmospheric Trend</h2>
+        <span id="trend-window" class="section-note">Recent hourly atmospheric data</span>
+      </div>
+
+      <div id="trend-note" class="chart-note" hidden></div>
+
+      <h3 class="chart-title">Temperature &amp; Relative Humidity</h3>
+      <div class="chart-box chart-box-tall"><canvas id="trend-chart"></canvas></div>
+
+      <h3 class="chart-title">Hourly Precipitation</h3>
+      <div class="chart-box"><canvas id="precip-chart"></canvas></div>
+
+      <p class="footnote">
+        Latest available hourly atmospheric data at or before the current time, plotted exactly
+        as returned by Open-Meteo. This is short-range model output from the provider, not a
+        station measurement, and no historical value is interpolated or invented.
+      </p>
+    </section>
+
+    <!-- ============ 5b. HISTORICAL SCENARIO DEMONSTRATION ============ -->
+    <section class="card scenario-card" id="scenario-section">
+      <div class="section-head">
+        <h2>Historical Scenario Demonstration</h2>
+        <span class="risk-head-tags">
+          <span class="mode-chip mode-scenario">Historical Scenario</span>
+          <span class="badge-demo">Demonstration Only</span>
+        </span>
+      </div>
+
+      <div class="mode-split">
+        <div class="mode-box">
+          <h3 class="mode-title mode-live-title">Live Mode</h3>
+          <p class="mode-note">
+            Latest available Open-Meteo hourly atmospheric data for {{ location }}, scored by
+            the model in real time. Shown in the risk and condition cards above.
+          </p>
+        </div>
+        <div class="mode-box">
+          <h3 class="mode-title mode-scenario-title">Historical Scenario</h3>
+          <p class="mode-note">
+            A real historical test-set row replayed from the Phase&nbsp;1 dataset. It does not
+            replace, override or alter the live reading above.
+          </p>
+        </div>
+      </div>
+
+      <p class="scenario-intro">
+        Today's conditions may be Low Risk. This section replays a real historical test-set
+        situation to demonstrate how the model behaves under elevated-risk atmospheric
+        conditions.
+      </p>
+
+      <button id="scenario-button" type="button" class="btn btn-secondary">
+        Run Historical Scenario
+      </button>
+
+      <div id="scenario-error" class="scenario-error" role="alert" hidden></div>
+
+      <div id="scenario-result" hidden>
+        <p class="scenario-timestamp">
+          Historical test-set timestamp (UTC): <strong id="scenario-timestamp">&mdash;</strong>
+        </p>
+
+        <div class="scenario-grid">
+          <div class="scenario-block">
+            <h3 class="block-title">Model Prediction</h3>
+            <p class="footnote block-sub">
+              Produced by the existing Phase&nbsp;1 model from the 24 features available at the
+              selected historical timestamp.
+            </p>
+
+            <div class="scenario-headline">
+              <div class="risk-stat">
+                <span class="stat-label">Risk label</span>
+                <span id="scenario-label" class="scenario-label">&mdash;</span>
+              </div>
+              <div class="risk-stat">
+                <span class="stat-label">Model probability (Elevated Risk class)</span>
+                <span id="scenario-probability" class="stat-value">&mdash;</span>
+                <div class="prob-track"><div id="scenario-probability-bar" class="prob-fill"></div></div>
+              </div>
+              <div class="risk-stat">
+                <span class="stat-label">Prediction horizon</span>
+                <span class="stat-value stat-value-sm">Next 3 Hours</span>
+              </div>
+            </div>
+
+            <h4 class="mini-title">Historical atmospheric inputs</h4>
+            <table class="data-table"><tbody id="scenario-inputs"></tbody></table>
+
+            <h4 class="mini-title">Historical lag &amp; rolling features</h4>
+            <table class="data-table"><tbody id="scenario-lags"></tbody></table>
+          </div>
+
+          <div class="scenario-block outcome-block">
+            <h3 class="block-title">Observed 3-Hour Proxy Outcome</h3>
+            <p class="footnote block-sub">
+              Presented separately, after the prediction. This value is never used as a model
+              input.
+            </p>
+
+            <div class="outcome-grid">
+              <div class="outcome-stat">
+                <span class="stat-label">Accumulated precipitation, next 3 h</span>
+                <span id="scenario-future-precip" class="stat-value">&mdash;</span>
+              </div>
+              <div class="outcome-stat">
+                <span class="stat-label">Observed proxy class</span>
+                <span id="scenario-actual-label" class="stat-value stat-value-sm">&mdash;</span>
+              </div>
+            </div>
+
+            <p class="footnote" id="scenario-outcome-note">&mdash;</p>
+            <p class="leak-strip" id="scenario-leak-strip">&mdash;</p>
+          </div>
+        </div>
+
+        <p class="footnote" id="scenario-explanation">&mdash;</p>
+        <p class="scenario-caveat" id="scenario-caveat">&mdash;</p>
+      </div>
+    </section>
+
+    <!-- ================= 6. MODEL PERFORMANCE ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2 id="evaluation-title">{{ evaluation_title }}</h2>
+        <span class="section-note">Chronological hold-out test set</span>
+      </div>
+
+      <div id="metrics-note" class="caveat">{{ evaluation_caveat }}</div>
+
+      <div id="metrics-grid" class="metrics-grid">
+        <!-- populated by dashboard.js from outputs/evaluation.json -->
+      </div>
+      <p class="footnote" id="metrics-source">&mdash;</p>
+    </section>
+
+    <!-- ================= 7. FEATURE IMPORTANCE ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Feature Importance</h2>
+        <span class="section-note">Random Forest, top predictors</span>
+      </div>
+      <div id="importance-list" class="importance-list">
+        <!-- populated by dashboard.js from outputs/feature_importance.csv -->
+      </div>
+      <p class="footnote" id="importance-source">&mdash;</p>
+    </section>
+
+    <!-- ================= 8. CONFUSION MATRIX ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Test Confusion Matrix &mdash; Surrogate Target</h2>
+      </div>
+      <div class="matrix-wrap">
+        <img id="confusion-image" class="confusion-image" alt="Test confusion matrix for the surrogate high-precipitation risk target">
+        <div class="matrix-side">
+          <p class="footnote" id="matrix-decode">&mdash;</p>
+          <p class="footnote">
+            Rows are actual labels and columns are predicted labels, ordered
+            [Low Risk, Elevated Risk]. The image is the unmodified Phase&nbsp;1 artifact.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= 9. DATA & AI PIPELINE ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Data &amp; AI Pipeline</h2>
+      </div>
+      <ol class="pipeline">
+        <li>
+          <span class="stage">Historical Atmospheric Data</span>
+          <span class="stage-note">Hourly Open-Meteo archive, 2000&ndash;2025, at this location.</span>
+        </li>
+        <li>
+          <span class="stage">Data Cleaning</span>
+          <span class="stage-note">Chronological sort, duplicate and gap checks; 9 of 227,928 rows dropped where features or the future window were unavailable.</span>
+        </li>
+        <li>
+          <span class="stage">Temporal Feature Engineering</span>
+          <span class="stage-note">24 predictors: current values, 1&nbsp;h/3&nbsp;h changes, rolling precipitation, humidity and pressure, plus cyclical hour and month.</span>
+        </li>
+        <li>
+          <span class="stage">Random Forest ML</span>
+          <span class="stage-note">400 trees, class-weighted, fixed random seed, trained on a chronological 70% split.</span>
+        </li>
+        <li>
+          <span class="stage">3-Hour Risk Proxy</span>
+          <span class="stage-note">Target: accumulated precipitation over the next 3 hours versus the training-only 90th percentile (2.0&nbsp;mm / 3&nbsp;h).</span>
+        </li>
+        <li>
+          <span class="stage">Real-Time Atmospheric Input</span>
+          <span class="stage-note">Latest available Open-Meteo hourly atmospheric data for this location, current hour and earlier only.</span>
+        </li>
+        <li>
+          <span class="stage">AI Risk Estimate</span>
+          <span class="stage-note">Low Risk or Elevated Risk for the next 3 hours, with the model's output probability.</span>
+        </li>
+      </ol>
+    </section>
+
+    <!-- ================= 10. DATA SOURCE / INTEGRATION STATUS ================= -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Data Source &amp; Integration Status</h2>
+      </div>
+
+      <div class="integration-columns">
+        <div>
+          <h3 class="integration-title integration-active">Active</h3>
+          <ul class="integration-list">
+            <li class="ok"><span class="mark">&#10003;</span> Historical atmospheric dataset</li>
+            <li class="ok"><span class="mark">&#10003;</span> Real-time Open-Meteo weather input</li>
+            <li class="ok"><span class="mark">&#10003;</span> Machine-learning prediction</li>
+            <li class="ok"><span class="mark">&#10003;</span> Flask prediction API</li>
+          </ul>
+        </div>
+        <div>
+          <h3 class="integration-title integration-inactive">Not Currently Integrated</h3>
+          <ul class="integration-list">
+            <li class="off"><span class="mark">&#9675;</span> Weather radar</li>
+            <li class="off"><span class="mark">&#9675;</span> Satellite imagery</li>
+            <li class="off"><span class="mark">&#9675;</span> Direct lightning observations</li>
+            <li class="off"><span class="mark">&#9675;</span> Numerical weather prediction model data</li>
+          </ul>
+          <p class="footnote">Planned enhancement &mdash; not used by the current prediction.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="app-footer">
+    <p class="footer-line">
+      <strong>SIH 2026</strong> &middot; {{ location }} &middot; AI/ML Prototype
+    </p>
+    <p class="footer-disclaimer">{{ disclaimer }}</p>
+    <p class="footer-fine">
+      {{ metric_caveat }} This dashboard stores no prediction results and requires no
+      authentication or API key.
+    </p>
+  </footer>
+</body>
+</html>
