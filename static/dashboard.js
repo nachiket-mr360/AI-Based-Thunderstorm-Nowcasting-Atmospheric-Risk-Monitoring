@@ -1,18 +1,21 @@
 /* ==========================================================================
-   SIH 2026 dashboard front-end.
-   Vanilla JavaScript, no build step. Talks only to the existing Flask API:
-     GET /api/prediction   Phase 7 1-hour thunderstorm nowcast (source of truth)
-     GET /api/history      latest available real hourly atmospheric data (trend charts)
-     GET /api/evaluation   Phase 1 metrics + feature importance (read-only)
-     GET /api/health       model status
-   No prediction value is computed or defaulted in the browser, and nothing is
-   persisted to storage. Probability is a model score, not confidence.
+   SIH 2026 / SIH26072 — Phase 9 decision-support dashboard.
+   Vanilla JS, no build step.
+
+   Primary source of truth:
+     GET /api/prediction   Phase 7/8 1-hour thunderstorm nowcast
+   Supporting:
+     GET /api/history      recent atmospheric hours for charts
+     GET /api/health       optional status
+     GET /api/evaluation   Phase 1 proxy metrics (reference only)
+     GET /api/scenario     Phase 1 historical proxy demo
+
+   The browser never invents weather, probability, or surrounding spatial risk.
+   Probability is a model score — never labelled "confidence".
    ========================================================================== */
 
 (function () {
   "use strict";
-
-  /* ------------------------------- config -------------------------------- */
 
   var CONDITION_FIELDS = [
     { key: "temperature_2m", label: "Temperature" },
@@ -35,10 +38,25 @@
   var TOP_FEATURES = 15;
   var COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
                  "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"];
-
   var EMPTY = "\u2014";
+  var LOCKED_THRESHOLD = 0.0775;
+  var EXPECTED_LEAD_HOURS = 1;
 
-  /* ------------------------------ tiny helpers --------------------------- */
+  /* Map state: a FeatureGroup so multi-point predictions can be added later
+     without inventing values today. Only real API points are drawn. */
+  var mapState = {
+    map: null,
+    riskLayer: null,
+    baseReady: false,
+    defaultLat: null,
+    defaultLon: null,
+    locationName: ""
+  };
+
+  var chartState = { temperature: null, precipitation: null };
+  var scenarioRun = false;
+
+  /* ------------------------------ helpers -------------------------------- */
 
   function el(id) { return document.getElementById(id); }
 
@@ -65,7 +83,7 @@
     if (!iso) { return EMPTY; }
     var date = new Date(iso);
     if (isNaN(date.getTime())) { return String(iso); }
-    return date.toISOString().replace("T", " ").replace("Z", "").replace(".000", "");
+    return date.toISOString().replace("T", " ").replace(/\.\d{3}Z$/, "Z").replace("Z", " UTC");
   }
 
   function formatHourTick(iso) {
@@ -74,15 +92,21 @@
     return String(date.getUTCHours()).padStart(2, "0") + ":00";
   }
 
-  /* --------------------------------- API ---------------------------------- */
+  function fmtCoord(value, digits) {
+    return isNum(value) ? Number(value).toFixed(digits) : EMPTY;
+  }
+
+  /* --------------------------------- API --------------------------------- */
 
   var Api = {
     get: function (path) {
-      return fetch(path, { headers: { Accept: "application/json" } })
+      return fetch(path, { headers: { Accept: "application/json" }, cache: "no-store" })
         .then(function (response) {
           return response.json()
             .catch(function () { return null; })
-            .then(function (data) { return { ok: response.ok, status: response.status, data: data }; });
+            .then(function (data) {
+              return { ok: response.ok, status: response.status, data: data };
+            });
         })
         .catch(function (error) {
           return { ok: false, status: 0, data: null, networkError: String(error) };
@@ -90,27 +114,39 @@
     }
   };
 
-  /* ------------------------------ status / errors ------------------------- */
+  /* ------------------------- operational states -------------------------- */
+
+  var STATUS_COPY = {
+    pending: "Loading",
+    live: "LIVE \u00b7 latest available data",
+    api_unavailable: "API unavailable",
+    prediction_unavailable: "Prediction unavailable",
+    stale: "Data stale / unavailable"
+  };
 
   function setStatus(state) {
     var pill = el("live-status");
     var text = el("live-status-text");
     if (!pill || !text) { return; }
-    pill.className = "status-pill " + ({
+    var klass = {
       pending: "status-pending",
       live: "status-live",
-      error: "status-error"
-    }[state] || "status-pending");
-    text.textContent = { pending: "Connecting\u2026", live: "Live Data", error: "Data Unavailable" }[state] || "";
+      api_unavailable: "status-error",
+      prediction_unavailable: "status-error",
+      stale: "status-warn"
+    }[state] || "status-pending";
+    pill.className = "status-pill " + klass;
+    pill.setAttribute("data-state", state);
+    text.textContent = STATUS_COPY[state] || state;
   }
 
   function showError(message, detail) {
     var banner = el("error-banner");
     if (!banner) { return; }
+    setText("error-title", message);
     setText("error-detail", detail || "");
     var detailNode = el("error-detail");
     if (detailNode) { detailNode.hidden = !detail; }
-    banner.querySelector(".error-banner-head strong").textContent = message;
     banner.hidden = false;
   }
 
@@ -120,83 +156,146 @@
   }
 
   function describeFailure(result) {
-    if (result.networkError) {
-      return { message: "Live weather data is temporarily unavailable. No prediction was generated.",
-               detail: "Could not reach the prediction API: " + result.networkError };
+    if (result.networkError || result.status === 0) {
+      return {
+        state: "api_unavailable",
+        message: "API unavailable. No nowcast was generated.",
+        detail: "Could not reach the prediction API" +
+          (result.networkError ? ": " + result.networkError : ".")
+      };
     }
     var data = result.data || {};
-    if (data.error) {
+    if (data.error || !result.ok) {
+      var code = data.code || ("http_" + result.status);
+      var stale = /stale/i.test(String(code)) || /stale/i.test(String(data.message || ""));
       return {
-        message: "Live weather data is temporarily unavailable. No prediction was generated.",
-        detail: "Backend reported " + (data.code || "an error") + ": " + (data.message || "no detail") +
-                (data.detail ? " (" + JSON.stringify(data.detail) + ")" : "")
+        state: stale ? "stale" : "prediction_unavailable",
+        message: stale
+          ? "Atmospheric data is stale or unavailable. No nowcast was generated."
+          : "Prediction unavailable. No nowcast was generated.",
+        detail: "Backend reported " + code + ": " + (data.message || "no detail")
       };
     }
     return {
-      message: "Live weather data is temporarily unavailable. No prediction was generated.",
+      state: "prediction_unavailable",
+      message: "Prediction unavailable. No nowcast was generated.",
       detail: "Unexpected response (HTTP " + result.status + ")."
     };
   }
 
-  /* ---------------------------- risk card rendering ----------------------- */
+  /* ------------------------------ clear live ----------------------------- */
 
-  /** Blank every live value so a failed refresh can never leave stale numbers
-      on screen looking freshly fetched. */
   function clearLiveValues() {
     var label = el("risk-label");
     if (label) {
       label.textContent = EMPTY;
       label.className = "risk-label risk-label-empty";
     }
-    var card = document.querySelector(".risk-card");
+    var card = el("risk-section");
     if (card) { card.className = "card risk-card"; }
 
-    setText("probability", EMPTY);
-    setText("observation-timestamp", EMPTY);
-    setText("threshold", EMPTY);
+    [
+      "probability", "lead-time", "threshold", "feature-timestamp",
+      "prediction-timestamp", "model-identifier", "data-source",
+      "target-timestamp", "data-age", "feature-completeness"
+    ].forEach(function (id) { setText(id, EMPTY); });
+
     var bar = el("probability-bar");
     if (bar) { bar.style.width = "0%"; }
 
     var grid = el("conditions-grid");
     if (grid) { grid.innerHTML = ""; }
     setText("conditions-note", "Awaiting live data\u2026");
+    setText("skill-note",
+      "Measured Phase 6 test skill for this locked threshold is shown after a live prediction loads. " +
+      "An alert is a screening signal, not a definite thunderstorm forecast.");
+
+    clearRiskMarkers();
+    setText("map-mode-note", "Point / location-based risk");
+    setText("spatial-capability", "Single validated point (not a forecast grid)");
   }
 
-  function renderRisk(data) {
-    var label = el("risk-label");
-    var elevated = data.predicted_class === 1;
+  /* ------------------------------ risk card ------------------------------ */
 
+  function renderRisk(data) {
+    var elevated = data.predicted_class === 1;
+    var label = el("risk-label");
     if (label) {
       label.textContent = data.risk_label || EMPTY;
       label.className = "risk-label " + (elevated ? "risk-label-elevated" : "risk-label-low");
     }
-
-    var card = document.querySelector(".risk-card");
+    var card = el("risk-section");
     if (card) {
       card.className = "card risk-card " + (elevated ? "is-elevated" : "is-low");
     }
 
-    setText("probability", isNum(data.probability) ? (data.probability * 100).toFixed(2) + "%" : EMPTY);
+    setText("probability",
+      isNum(data.probability) ? (data.probability * 100).toFixed(2) + "%" : EMPTY);
     var bar = el("probability-bar");
     if (bar && isNum(data.probability)) {
       bar.style.width = Math.max(0, Math.min(100, data.probability * 100)).toFixed(2) + "%";
+      bar.className = "prob-fill " + (elevated ? "prob-alert" : "prob-low");
     }
 
-    var featureTs = data.feature_timestamp || data.observation_timestamp_utc;
-    setText("observation-timestamp", formatUtc(featureTs));
+    var lead = data.lead_time_hours;
+    setText("lead-time",
+      lead === EXPECTED_LEAD_HOURS || lead === "1"
+        ? "1 hour"
+        : (isNum(lead) ? lead + " hour" + (lead === 1 ? "" : "s") : EMPTY));
 
-    var model = data.model || {};
     if (isNum(data.threshold)) {
       setText("threshold", Number(data.threshold).toFixed(4));
-    } else if (isNum(model.decision_threshold)) {
-      setText("threshold", Number(model.decision_threshold).toFixed(4));
-    } else if (isNum(model.decision_threshold_mm_per_3h)) {
-      // Legacy surrogate proxy field only (retained at /api/prediction/proxy).
-      setText("threshold", model.decision_threshold_mm_per_3h + " mm / 3 h");
     } else {
-      setText("threshold", EMPTY);
+      setText("threshold", LOCKED_THRESHOLD.toFixed(4));
+    }
+
+    setText("feature-timestamp", formatUtc(data.feature_timestamp || data.observation_timestamp_utc));
+    setText("prediction-timestamp", formatUtc(data.prediction_timestamp));
+    setText("target-timestamp", formatUtc(data.target_timestamp));
+
+    var modelId = data.model_identifier || (data.model && data.model.name) || EMPTY;
+    setText("model-identifier", modelId);
+
+    var provenance = ((data.source || {}).provenance) || {};
+    var sourceBits = [];
+    if (provenance.provider) { sourceBits.push(provenance.provider); }
+    if (provenance.endpoint) {
+      try {
+        sourceBits.push(new URL(provenance.endpoint).hostname);
+      } catch (err) {
+        sourceBits.push(String(provenance.endpoint));
+      }
+    }
+    if ((data.source || {}).frame_origin) {
+      sourceBits.push(data.source.frame_origin);
+    }
+    setText("data-source", sourceBits.length ? sourceBits.join(" · ") : EMPTY);
+
+    var age = (data.temporal_semantics || {}).data_age_hours;
+    setText("data-age", isNum(age) ? age.toFixed(2) + " h" : EMPTY);
+
+    var completeness = data.feature_completeness || {};
+    if (isNum(completeness.n_features_provided) && isNum(completeness.n_features_expected)) {
+      setText("feature-completeness",
+        completeness.n_features_provided + "/" + completeness.n_features_expected +
+        (completeness.all_features_finite ? " finite" : ""));
+    } else {
+      setText("feature-completeness", EMPTY);
+    }
+
+    var skill = data.measured_skill_reference || {};
+    if (isNum(skill.recall) || isNum(skill.precision)) {
+      setText("skill-note",
+        "Phase 6 measured test skill at threshold " +
+        (isNum(data.threshold) ? Number(data.threshold).toFixed(4) : "0.0775") +
+        ": recall " + (isNum(skill.recall) ? skill.recall.toFixed(3) : EMPTY) +
+        ", precision " + (isNum(skill.precision) ? skill.precision.toFixed(3) : EMPTY) +
+        ". An alert is a screening signal, not a definite thunderstorm. " +
+        "Probability is a model score, not confidence.");
     }
   }
+
+  /* --------------------------- atmosphere cards -------------------------- */
 
   function renderConditions(data) {
     var grid = el("conditions-grid");
@@ -208,6 +307,7 @@
       var entry = weather[field.key] || {};
       var wrapper = document.createElement("div");
       wrapper.className = "condition";
+      wrapper.setAttribute("data-var", field.key);
 
       var name = document.createElement("span");
       name.className = "condition-name";
@@ -232,57 +332,160 @@
     });
 
     var featureTs = data.feature_timestamp || data.observation_timestamp_utc;
-    setText("conditions-note", "Feature hour " + formatUtc(featureTs) + " UTC (latest available atmospheric data)");
+    setText("conditions-note", "Feature hour " + formatUtc(featureTs));
   }
 
-  /* --------------------------------- map ---------------------------------- */
+  /* --------------------------------- map --------------------------------- */
+
+  function clearRiskMarkers() {
+    if (mapState.riskLayer) {
+      mapState.riskLayer.clearLayers();
+    }
+  }
+
+  function riskIcon(elevated) {
+    var color = elevated ? "#a3520a" : "#14713f";
+    return L.divIcon({
+      className: "risk-marker-wrap",
+      html: '<span class="risk-marker" style="background:' + color +
+            ';border-color:' + color + '"></span>',
+      iconSize: [18, 18],
+      iconAnchor: [9, 9]
+    });
+  }
+
+  /**
+   * Render real prediction points only.
+   * Contract: each entry must come from the API (or the known served cell for
+   * that same live prediction). Never synthesize neighbouring cell risks.
+   */
+  function renderSpatialRisk(points) {
+    if (!mapState.map || !mapState.riskLayer) { return; }
+    clearRiskMarkers();
+
+    var list = Array.isArray(points) ? points.slice() : [];
+    list.forEach(function (point) {
+      if (!isNum(point.latitude) || !isNum(point.longitude)) { return; }
+      var elevated = point.predicted_class === 1;
+      var marker = L.marker([point.latitude, point.longitude], {
+        icon: riskIcon(elevated),
+        keyboard: true,
+        title: point.risk_label || "Point risk"
+      });
+
+      var html =
+        "<div class='map-popup'>" +
+        "<strong>" + (point.risk_label || "Point / location-based risk") + "</strong><br>" +
+        "Probability: " + (isNum(point.probability)
+          ? (point.probability * 100).toFixed(2) + "%"
+          : EMPTY) + "<br>" +
+        "Threshold: " + (isNum(point.threshold)
+          ? Number(point.threshold).toFixed(4)
+          : EMPTY) + "<br>" +
+        "Lead time: " + (point.lead_time_hours != null
+          ? point.lead_time_hours + " h"
+          : EMPTY) + "<br>" +
+        "<span class='mono'>" + fmtCoord(point.latitude, 6) + "&deg; N, " +
+        fmtCoord(point.longitude, 5) + "&deg; E</span><br>" +
+        "<em>Single grid cell &mdash; not a spatial forecast grid</em>" +
+        "</div>";
+      marker.bindPopup(html);
+      mapState.riskLayer.addLayer(marker);
+    });
+
+    if (list.length === 1) {
+      mapState.map.setView([list[0].latitude, list[0].longitude], 11, { animate: false });
+    } else if (list.length > 1) {
+      mapState.map.fitBounds(mapState.riskLayer.getBounds().pad(0.35), { animate: false });
+    }
+
+    setText("map-mode-note",
+      list.length <= 1
+        ? "Point / location-based risk"
+        : ("Multi-point risk (" + list.length + " validated cells)"));
+    setText("spatial-capability",
+      list.length <= 1
+        ? "Single validated point (not a forecast grid)"
+        : (list.length + " validated prediction points (no invented cells)"));
+  }
+
+  function updateMapFromPrediction(data) {
+    var served = data.served_grid_cell ||
+      (((data.source || {}).provenance) || {}).served_grid_cell || {};
+    var lat = isNum(served.latitude) ? served.latitude : mapState.defaultLat;
+    var lon = isNum(served.longitude) ? served.longitude : mapState.defaultLon;
+
+    if (isNum(lat) && isNum(lon)) {
+      setText("served-coords",
+        fmtCoord(lat, 6) + "\u00b0 N, " + fmtCoord(lon, 5) + "\u00b0 E");
+    }
+
+    // Exactly one real prediction point — never fabricate neighbours.
+    renderSpatialRisk([{
+      latitude: lat,
+      longitude: lon,
+      probability: data.probability,
+      predicted_class: data.predicted_class,
+      risk_label: data.risk_label,
+      threshold: data.threshold,
+      lead_time_hours: data.lead_time_hours,
+      model_identifier: data.model_identifier || ((data.model || {}).name)
+    }]);
+  }
 
   function initMap() {
     var container = el("map");
     if (!container) { return; }
 
-    var latitude = parseFloat(container.dataset.latitude);
-    var longitude = parseFloat(container.dataset.longitude);
-    var locationName = container.dataset.location || "Target location";
+    mapState.defaultLat = parseFloat(container.dataset.latitude);
+    mapState.defaultLon = parseFloat(container.dataset.longitude);
+    mapState.locationName = container.dataset.location || "Thiruvananthapuram";
 
     if (typeof L === "undefined") {
-      container.innerHTML = '<div class="map-fallback">Map library unavailable (offline?). ' +
-        'Target location: ' + locationName + " \u2014 " + latitude + "\u00b0 N, " + longitude + "\u00b0 E.</div>";
+      container.innerHTML =
+        '<div class="map-fallback">Map library unavailable. Served grid: ' +
+        mapState.defaultLat + "\u00b0 N, " + mapState.defaultLon + "\u00b0 E " +
+        "(point / location-based risk only).</div>";
       return;
     }
 
     var map = L.map(container, {
-      center: [latitude, longitude],
+      center: [mapState.defaultLat, mapState.defaultLon],
       zoom: 11,
-      scrollWheelZoom: false
+      scrollWheelZoom: false,
+      attributionControl: true
     });
 
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-      maxZoom: 18,
-      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    // CARTO basemap (OSM-derived). The public tile.openstreetmap.org endpoint
+    // returns HTTP 403 for many browser clients; CARTO does not require an API key
+    // for light demo use and keeps correct OSM + CARTO attribution.
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
+      maxZoom: 19,
+      subdomains: "abcd",
+      attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> ' +
+        'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
     }).addTo(map);
 
-    // Approximate locator circle only - explicitly not a forecast grid.
-    L.circle([latitude, longitude], {
-      radius: 9000,
+    // Empty risk layer ready for 1..N real prediction points.
+    mapState.riskLayer = L.featureGroup().addTo(map);
+    mapState.map = map;
+    mapState.baseReady = true;
+
+    // Context crosshair only — explicitly NOT a prediction footprint / km grid.
+    L.circleMarker([mapState.defaultLat, mapState.defaultLon], {
+      radius: 5,
       color: "#0b5c96",
-      weight: 2,
+      weight: 1,
       fillColor: "#1273b8",
-      fillOpacity: 0.14
+      fillOpacity: 0.25,
+      interactive: false
     }).addTo(map);
 
-    var marker = L.marker([latitude, longitude]).addTo(map);
-    marker.bindPopup(
-      "<strong>Target Observation Location</strong><br>" + locationName +
-      "<br>" + latitude + "\u00b0 N, " + longitude + "\u00b0 E"
-    ).openPopup();
-
-    marker.bindTooltip("Target Observation Location", { permanent: false });
+    setTimeout(function () { map.invalidateSize(); }, 80);
   }
 
-  /* -------------------------------- charts -------------------------------- */
-
-  var chartState = { temperature: null, precipitation: null };
+  /* -------------------------------- charts ------------------------------- */
 
   function chartLibraryAvailable() {
     return typeof Chart !== "undefined";
@@ -303,8 +506,7 @@
 
   function renderTrends(data) {
     if (!chartLibraryAvailable()) {
-      noteTrend("Chart library could not be loaded (offline?). The live atmospheric data " +
-                "remains available through GET /api/history.");
+      noteTrend("Chart library could not be loaded. Live atmospheric values remain available above.");
       return;
     }
     var hours = (data && data.hours) || [];
@@ -315,13 +517,14 @@
     clearTrendNote();
 
     var labels = hours.map(function (hour) { return formatHourTick(hour.timestamp_utc); });
-    var temperatures = hours.map(function (hour) { return isNum(hour.temperature_2m) ? hour.temperature_2m : null; });
-    var humidities = hours.map(function (hour) { return isNum(hour.relative_humidity_2m) ? hour.relative_humidity_2m : null; });
-    var precipitation = hours.map(function (hour) { return isNum(hour.precipitation) ? hour.precipitation : null; });
+    var temperatures = hours.map(function (h) { return isNum(h.temperature_2m) ? h.temperature_2m : null; });
+    var humidities = hours.map(function (h) { return isNum(h.relative_humidity_2m) ? h.relative_humidity_2m : null; });
+    var precipitation = hours.map(function (h) { return isNum(h.precipitation) ? h.precipitation : null; });
     var units = data.units || {};
 
-    setText("trend-window", hours.length + " hours · " + formatUtc(data.window_start_utc) +
-      " to " + formatUtc(data.window_end_utc) + " UTC");
+    setText("trend-window",
+      hours.length + " hours · " + formatUtc(data.window_start_utc) +
+      " → " + formatUtc(data.window_end_utc));
 
     if (chartState.temperature) { chartState.temperature.destroy(); }
     if (chartState.precipitation) { chartState.precipitation.destroy(); }
@@ -335,10 +538,10 @@
             label: "Temperature (" + (units.temperature_2m || "\u00b0C") + ")",
             data: temperatures,
             borderColor: "#c9453c",
-            backgroundColor: "rgba(201, 69, 60, 0.12)",
+            backgroundColor: "rgba(201, 69, 60, 0.10)",
             borderWidth: 2,
             pointRadius: 0,
-            pointHoverRadius: 4,
+            pointHoverRadius: 3,
             tension: 0.25,
             spanGaps: false,
             yAxisID: "y"
@@ -346,11 +549,11 @@
           {
             label: "Relative Humidity (" + (units.relative_humidity_2m || "%") + ")",
             data: humidities,
-            borderColor: "#1273b8",
-            backgroundColor: "rgba(18, 115, 184, 0.10)",
+            borderColor: "#0b5c96",
+            backgroundColor: "rgba(11, 92, 150, 0.08)",
             borderWidth: 2,
             pointRadius: 0,
-            pointHoverRadius: 4,
+            pointHoverRadius: 3,
             tension: 0.25,
             spanGaps: false,
             yAxisID: "y1"
@@ -363,12 +566,11 @@
         animation: false,
         interaction: { mode: "index", intersect: false },
         plugins: {
-          legend: { labels: { boxWidth: 12, font: { size: 11 } } },
+          legend: { labels: { boxWidth: 10, font: { size: 11 } } },
           tooltip: {
             callbacks: {
               title: function (items) {
-                var index = items[0].dataIndex;
-                return formatUtc(hours[index].timestamp_utc) + " UTC";
+                return formatUtc(hours[items[0].dataIndex].timestamp_utc);
               }
             }
           }
@@ -376,7 +578,7 @@
         scales: {
           x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8, font: { size: 10 } },
                grid: { display: false } },
-          y: { position: "left", title: { display: true, text: "°C", font: { size: 10 } },
+          y: { position: "left", title: { display: true, text: "\u00b0C", font: { size: 10 } },
                ticks: { font: { size: 10 } } },
           y1: { position: "right", suggestedMin: 0, suggestedMax: 100,
                 title: { display: true, text: "%", font: { size: 10 } },
@@ -403,12 +605,11 @@
         maintainAspectRatio: false,
         animation: false,
         plugins: {
-          legend: { labels: { boxWidth: 12, font: { size: 11 } } },
+          legend: { labels: { boxWidth: 10, font: { size: 11 } } },
           tooltip: {
             callbacks: {
               title: function (items) {
-                var index = items[0].dataIndex;
-                return formatUtc(hours[index].timestamp_utc) + " UTC";
+                return formatUtc(hours[items[0].dataIndex].timestamp_utc);
               }
             }
           }
@@ -423,7 +624,7 @@
     });
   }
 
-  /* ------------------------- evaluation + importance ---------------------- */
+  /* -------------------- Phase 1 reference (demoted) ---------------------- */
 
   function renderEvaluation(data) {
     setText("evaluation-title", data.section_title || el("evaluation-title").textContent);
@@ -436,116 +637,88 @@
       METRIC_FIELDS.forEach(function (field) {
         var card = document.createElement("div");
         card.className = "metric-card";
-
         var name = document.createElement("span");
         name.className = "metric-name";
         name.textContent = field.label;
-
         var value = document.createElement("span");
         value.className = "metric-value-lg";
-        value.textContent = isNum(metrics[field.key]) ? metrics[field.key].toFixed(field.digits) : EMPTY;
-
+        value.textContent = isNum(metrics[field.key])
+          ? metrics[field.key].toFixed(field.digits)
+          : EMPTY;
         card.appendChild(name);
         card.appendChild(value);
         grid.appendChild(card);
       });
-
-      var samples = document.createElement("div");
-      samples.className = "metric-card";
-      var sname = document.createElement("span");
-      sname.className = "metric-name";
-      sname.textContent = "Test samples";
-      var svalue = document.createElement("span");
-      svalue.className = "metric-value-lg";
-      svalue.textContent = isNum(metrics.n_samples) ? metrics.n_samples.toLocaleString() : EMPTY;
-      samples.appendChild(sname);
-      samples.appendChild(svalue);
-      grid.appendChild(samples);
     }
 
     var sources = data.sources || {};
-    setText("metrics-source", "Values read directly from " + (sources.evaluation || "outputs/evaluation.json") +
-      " as generated in Phase 1. Nothing is recomputed or rounded here.");
+    setText("metrics-source",
+      "Phase 1 surrogate metrics from " +
+      (sources.evaluation || "outputs/evaluation.json") +
+      ". Not thunderstorm detection accuracy.");
 
-    // Confusion matrix image (unmodified Phase 1 artifact) + numeric decode.
     var image = el("confusion-image");
     var matrix = data.confusion_matrix || {};
-    if (image && matrix.image_url) {
-      image.src = matrix.image_url;
-    }
+    if (image && matrix.image_url) { image.src = matrix.image_url; }
 
     var decoded = el("matrix-decode");
     if (decoded && Array.isArray(matrix.matrix) && matrix.matrix.length === 2) {
       var labels = matrix.labels || ["Low Risk", "Elevated Risk"];
       var tn = matrix.matrix[0][0], fp = matrix.matrix[0][1];
       var fn = matrix.matrix[1][0], tp = matrix.matrix[1][1];
-      var total = isNum(metrics.n_samples) ? metrics.n_samples.toLocaleString() : (tn + fp + fn + tp);
       decoded.textContent =
-        "Test set (" + total + " samples): " +
-        tn.toLocaleString() + " correctly " + labels[0] + "; " +
-        fp.toLocaleString() + " " + labels[0] + " predicted " + labels[1] + "; " +
-        fn.toLocaleString() + " " + labels[1] + " missed; " +
-        tp.toLocaleString() + " correctly " + labels[1] + ".";
+        "Surrogate test decode: " + tn + " TN, " + fp + " FP, " + fn + " FN, " + tp + " TP (" +
+        labels[0] + " / " + labels[1] + ").";
     }
   }
 
   function renderImportance(data) {
     var list = el("importance-list");
     if (!list) { return; }
-
     var rows = (data.feature_importance || []).slice();
     if (!rows.length) {
       list.innerHTML = "";
       setText("importance-source", "No feature importance values were returned.");
       return;
     }
-
     rows.sort(function (a, b) { return b.importance - a.importance; });
     var top = rows.slice(0, TOP_FEATURES);
     var max = top[0].importance || 1;
-
     list.innerHTML = "";
     top.forEach(function (row) {
       var wrapper = document.createElement("div");
       wrapper.className = "importance-row";
-
       var name = document.createElement("span");
       name.className = "importance-name";
       name.textContent = row.feature;
       name.title = row.feature;
-
       var track = document.createElement("div");
       track.className = "importance-track";
       var fill = document.createElement("div");
       fill.className = "importance-fill";
       fill.style.width = Math.max(0, (row.importance / max) * 100).toFixed(1) + "%";
       track.appendChild(fill);
-
       var value = document.createElement("span");
       value.className = "importance-value";
       value.textContent = isNum(row.importance) ? row.importance.toFixed(4) : EMPTY;
-
       wrapper.appendChild(name);
       wrapper.appendChild(track);
       wrapper.appendChild(value);
       list.appendChild(wrapper);
     });
-
-    var sources = data.sources || {};
-    setText("importance-source", "Top " + top.length + " of " + rows.length +
-      " predictors, read directly from " + (sources.feature_importance || "outputs/feature_importance.csv") +
-      ". Values are the Random Forest importances produced in Phase 1.");
+    setText("importance-source",
+      "Top " + top.length + " Phase 1 proxy predictors (not the thunderstorm nowcast feature set).");
   }
 
-  /* ------------------- historical scenario demonstration ------------------ */
-
-  var scenarioRun = false;
+  /* ------------------------- historical scenario ------------------------- */
 
   function setScenarioBusy(busy) {
     var button = el("scenario-button");
     if (!button) { return; }
     button.disabled = busy;
-    button.textContent = busy ? "Running\u2026" : (scenarioRun ? "Run Historical Scenario Again" : "Run Historical Scenario");
+    button.textContent = busy
+      ? "Running\u2026"
+      : (scenarioRun ? "Run Historical Scenario Again" : "Run Historical Scenario");
   }
 
   function showScenarioError(message) {
@@ -585,70 +758,58 @@
   function renderScenario(data) {
     scenarioRun = true;
     hideScenarioError();
-
-    setText("scenario-timestamp", formatUtc(data.historical_timestamp) + " UTC");
+    setText("scenario-timestamp", formatUtc(data.historical_timestamp));
 
     var elevated = data.predicted_class === 1;
     var labelNode = el("scenario-label");
     if (labelNode) {
       labelNode.textContent = data.risk_label || EMPTY;
-      labelNode.className = "scenario-label " + (elevated ? "scenario-label-elevated" : "scenario-label-low");
+      labelNode.className = "scenario-label " +
+        (elevated ? "scenario-label-elevated" : "scenario-label-low");
     }
 
-    setText("scenario-probability", isNum(data.probability) ? (data.probability * 100).toFixed(2) + "%" : EMPTY);
+    setText("scenario-probability",
+      isNum(data.probability) ? (data.probability * 100).toFixed(2) + "%" : EMPTY);
     var bar = el("scenario-probability-bar");
     if (bar && isNum(data.probability)) {
       bar.style.width = Math.max(0, Math.min(100, data.probability * 100)).toFixed(2) + "%";
     }
 
-    // Historical atmospheric inputs, exactly as recorded at that timestamp.
-    var conditions = data.input_atmospheric_conditions || {};
-    fillTable("scenario-inputs", CONDITION_FIELDS.map(function (field) {
-      var entry = conditions[field.key] || {};
-      var shown = oneDecimal(entry.value);
+    var weather = data.input_atmospheric_conditions || {};
+    var inputRows = CONDITION_FIELDS.map(function (field) {
+      var entry = weather[field.key] || {};
+      var value = entry.value;
       return {
         label: field.label,
-        value: (shown === null ? EMPTY : shown + " " + (entry.unit || "")).trim()
+        value: isNum(value)
+          ? value.toFixed(1) + (entry.unit ? " " + entry.unit : "")
+          : EMPTY
       };
-    }));
+    });
+    fillTable("scenario-inputs", inputRows);
 
     var lags = data.historical_lag_and_rolling_features || {};
-    fillTable("scenario-lags", Object.keys(lags).map(function (name) {
-      return { label: humaniseFeature(name), value: isNum(lags[name]) ? lags[name].toFixed(4) : EMPTY };
-    }));
+    var lagRows = Object.keys(lags).map(function (key) {
+      return {
+        label: humaniseFeature(key),
+        value: isNum(lags[key]) ? Number(lags[key]).toFixed(4) : String(lags[key])
+      };
+    });
+    fillTable("scenario-lags", lagRows);
 
-    // Observed outcome, rendered in a separate block from the prediction.
     var outcome = data.actual_proxy_outcome || {};
-    var precip = el("scenario-future-precip");
-    if (precip) {
-      precip.textContent = isNum(outcome.future_precip_3h)
-        ? outcome.future_precip_3h.toFixed(1) + " mm / 3 h"
-        : EMPTY;
-    }
-
-    var actualNode = el("scenario-actual-label");
-    if (actualNode) {
-      actualNode.textContent = outcome.actual_label || EMPTY;
-      actualNode.className = "stat-value stat-value-sm " +
-        (outcome.actual_class === 1 ? "text-elevated" : "text-low");
-    }
-
-    var noteParts = [];
-    if (outcome.definition) { noteParts.push(outcome.definition); }
-    if (isNum(outcome.threshold_mm_per_3h)) {
-      noteParts.push("Threshold: " + outcome.threshold_mm_per_3h + " mm / 3 h (training-only 90th percentile).");
-    }
-    if (outcome.note) { noteParts.push(outcome.note); }
-    setText("scenario-outcome-note", noteParts.join(" "));
-
-    var leakOk = data.future_values_used_for_prediction === false &&
-                 data.future_precip_3h_is_input_feature === false;
-    setText("scenario-leak-strip", leakOk
-      ? "future_values_used_for_prediction: false \u2014 the next-3-hour precipitation was not used as a model input."
-      : "Warning: the response reports future values in the prediction path. Do not present this scenario.");
-
+    setText("scenario-future-precip",
+      isNum(outcome.future_precip_3h)
+        ? outcome.future_precip_3h.toFixed(2) + " mm"
+        : EMPTY);
+    setText("scenario-actual-label", outcome.actual_label || EMPTY);
+    setText("scenario-outcome-note", outcome.note || "");
+    setText("scenario-leak-strip",
+      data.future_values_used_for_prediction === false
+        ? "No future values were used as model inputs for this historical prediction."
+        : "Check leakage fields carefully.");
     setText("scenario-explanation", data.explanation || "");
-    setText("scenario-caveat", data.scenario_caveat || "");
+    setText("scenario-caveat", data.scenario_caveat || data.caveat || "");
 
     var result = el("scenario-result");
     if (result) { result.hidden = false; }
@@ -662,8 +823,8 @@
         if (result.ok && result.data && !result.data.error) {
           renderScenario(result.data);
         } else {
-          var failure = describeFailure(result);
-          showScenarioError("The historical scenario could not be loaded. " + failure.detail);
+          showScenarioError("The historical scenario could not be loaded. " +
+            describeFailure(result).detail);
         }
       })
       .catch(function (error) {
@@ -672,13 +833,13 @@
       .then(function () { setScenarioBusy(false); });
   }
 
-  /* ------------------------------- loaders -------------------------------- */
+  /* ------------------------------- loaders ------------------------------- */
 
   function setBusy(busy) {
     var button = el("refresh-button");
     if (!button) { return; }
     button.disabled = busy;
-    button.textContent = busy ? "Refreshing\u2026" : "Refresh Prediction";
+    button.textContent = busy ? "Refreshing\u2026" : "Refresh Nowcast";
   }
 
   function loadStatic() {
@@ -698,7 +859,6 @@
     setBusy(true);
     setStatus("pending");
     hideError();
-    // Blank the cards before fetching so nothing stale is ever shown as current.
     clearLiveValues();
 
     return Api.get("/api/prediction")
@@ -706,11 +866,14 @@
         if (prediction.ok && prediction.data && !prediction.data.error) {
           renderRisk(prediction.data);
           renderConditions(prediction.data);
+          updateMapFromPrediction(prediction.data);
           setStatus("live");
+          window.__PHASE9_LAST_PREDICTION__ = prediction.data;
         } else {
           var failure = describeFailure(prediction);
-          setStatus("error");
+          setStatus(failure.state);
           showError(failure.message, failure.detail);
+          window.__PHASE9_LAST_PREDICTION__ = null;
         }
       })
       .then(function () {
@@ -720,33 +883,38 @@
         if (history.ok && history.data && !history.data.error) {
           renderTrends(history.data);
         } else {
-          noteTrend("Recent hourly atmospheric data could not be loaded. " + describeFailure(history).detail);
+          noteTrend("Recent hourly atmospheric data could not be loaded. " +
+            describeFailure(history).detail);
         }
       })
       .then(function () { setBusy(false); })
       .catch(function (error) {
         setBusy(false);
-        setStatus("error");
-        showError("Live weather data is temporarily unavailable. No prediction was generated.", String(error));
+        setStatus("api_unavailable");
+        showError("API unavailable. No nowcast was generated.", String(error));
+        clearLiveValues();
       });
   }
 
-  /* --------------------------------- init --------------------------------- */
+  /* --------------------------------- init -------------------------------- */
 
   function init() {
     initMap();
     setStatus("pending");
+
     var button = el("refresh-button");
     if (button) {
       button.addEventListener("click", function () { loadLive(); });
     }
 
-    // The historical scenario is deliberately NOT run on page load: it is a
-    // demonstration the presenter triggers, and it must never replace live data.
     var scenarioButton = el("scenario-button");
     if (scenarioButton) {
       scenarioButton.addEventListener("click", function () { runScenario(); });
     }
+
+    window.addEventListener("resize", function () {
+      if (mapState.map) { mapState.map.invalidateSize(); }
+    });
 
     loadStatic();
     loadLive();

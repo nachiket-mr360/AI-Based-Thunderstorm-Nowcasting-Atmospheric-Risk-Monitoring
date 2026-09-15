@@ -102,6 +102,8 @@ if str(PROJECT_ROOT) not in sys.path:
 # --------------------------------------------------------------------------
 from backend import nowcast_service  # noqa: E402
 from ml.predict_thunderstorm_nowcast import (  # noqa: E402
+    DISCLAIMER as NOWCAST_DISCLAIMER,
+    TRAINING_SERVED_GRID_CELL,
     ThunderstormNowcastError,
 )
 from ml.predict import (  # noqa: E402
@@ -1042,18 +1044,28 @@ def _apply_response_headers(response):
 
 @app.route("/")
 def dashboard():
-    """Placeholder dashboard page that exercises the backend."""
+    """Phase 9 decision-support dashboard over the Phase 8 prediction API."""
+    # Display the Open-Meteo cell the model was trained on / is scored at.
+    # Rounded to the same public figures used in Phase 7/8 validation.
+    served_lat = round(float(TRAINING_SERVED_GRID_CELL["latitude"]), 6)
+    served_lon = round(float(TRAINING_SERVED_GRID_CELL["longitude"]), 5)
     return render_template(
         "index.html",
-        page_title="AI-Based Thunderstorm Nowcasting & Atmospheric Risk Monitoring",
+        page_title="Thunderstorm Nowcast Decision Support",
         proxy_name=PROXY_NAME,
         location=TARGET_LOCATION["location"],
         latitude=TARGET_LOCATION["latitude"],
         longitude=TARGET_LOCATION["longitude"],
-        disclaimer=DISCLAIMER_TEXT,
+        served_grid_latitude=served_lat,
+        served_grid_longitude=served_lon,
+        disclaimer=NOWCAST_DISCLAIMER,
         metric_caveat=METRIC_CAVEAT,
         evaluation_title=EVALUATION_SECTION_TITLE,
         evaluation_caveat=EVALUATION_CAVEAT,
+        imd_disclaimer=(
+            "This prototype provides AI-assisted short-horizon thunderstorm risk "
+            "information and is not a replacement for official IMD warnings."
+        ),
     )
 
 

@@ -1,0 +1,32 @@
+[primary ] thunderstorm nowcast (Phase 6/7) loaded: True
+[legacy  ] high-precipitation proxy (Phase 1) loaded: True
+Serving on http://127.0.0.1:63009/
+  GET /                dashboard
+  GET /api/health      health (add ?live=0 to skip the provider probe)
+  GET /api/prediction  1-hour thunderstorm nowcast (Phase 7 engine)
+ * Serving Flask app 'app'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on http://127.0.0.1:63009
+Press CTRL+C to quit
+127.0.0.1 - - [15/Sep/2026 10:59:52] "GET /api/health?live=0 HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 10:59:52] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 10:59:54] "GET /api/prediction HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:01] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:01] "GET /static/dashboard.js HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:01] "GET /static/style.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:03] "GET /api/evaluation HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:03] "GET /api/artifacts/confusion_matrix.png HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:04] "GET /api/prediction HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:06] "GET /api/history HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:12] "GET /api/prediction HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:13] "GET /api/history HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:14] "GET / HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:14] "GET /static/dashboard.js HTTP/1.1" 304 -
+127.0.0.1 - - [15/Sep/2026 11:00:14] "GET /static/style.css HTTP/1.1" 304 -
+127.0.0.1 - - [15/Sep/2026 11:00:14] "GET /api/evaluation HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:15] "GET /api/artifacts/confusion_matrix.png HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:16] "GET /api/prediction HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:17] "GET /api/history HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:18] "GET /static/style.css HTTP/1.1" 200 -
+127.0.0.1 - - [15/Sep/2026 11:00:18] "GET /static/dashboard.js HTTP/1.1" 200 -
