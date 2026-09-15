@@ -1,35 +1,67 @@
-"""Phase 2 prediction backend: Flask API over the existing Phase 1 ML model.
+"""Phase 8 prediction backend: Flask API over the verified Phase 7 nowcast engine.
 
-SIH 2026 prototype -- "AIML based Nowcasting of thunderstorm and lightning
+SIH 2026 (SIH26072) -- "AIML based nowcasting of thunderstorm and lightning
 using atmospheric observation including multiple radars, satellite, lightning
 and model data."
 
-SCOPE OF PHASE 2
-----------------
-This module only *serves* the already-trained Phase 1 model. It does not
-retrain, replace or modify the model, its feature set, or its target
-definition. It fetches real recent hourly weather for Thiruvananthapuram from
-the Open-Meteo forecast API, feeds it through the existing
-``ml.predict.predict_risk`` pipeline, and returns the result as JSON.
+WHAT THIS APPLICATION SERVES
+-----------------------------
+The primary product is a genuine **1-hour thunderstorm nowcast** for the VOTV
+station, produced end-to-end by the Phase 7 engine
+``ml/predict_thunderstorm_nowcast.py``:
 
-WHAT THE NUMBER MEANS (and does not mean)
------------------------------------------
-The served label is a *high-precipitation risk proxy* over the next 3 hours.
-The underlying Phase 1 target is a surrogate: ``storm_risk_proxy = 1`` when
-accumulated precipitation over the next 3 hours reaches the training-only 90th
-percentile. It is NOT a thunderstorm label and NOT a lightning label.
-The Phase 1 test metrics (ROC-AUC 0.8897, F1 0.4863) describe that surrogate
-proxy target only; they must never be presented as thunderstorm or lightning
-detection accuracy, nor as an official IMD warning.
+    latest available atmospheric hour t
+        -> the 28 Phase 4 causal features
+        -> probability that the station reports a thunderstorm in hour t + 1 h
+        -> a yes/no alert against the locked Phase 6 threshold 0.0775
+
+``GET /api/prediction`` returns that engine's payload. This module performs no
+inference, no feature engineering, no thresholding and no data fetching of its
+own -- see ``backend/nowcast_service.py``, which is a thin transport layer.
+
+The Phase 2 application that used to occupy this file is retained, not
+replaced. Its surrogate high-precipitation proxy endpoints are unchanged and
+now live alongside the nowcast:
+
+    GET /api/prediction/proxy   Phase 1 high-precipitation risk proxy (surrogate)
+    GET /api/history            recent hourly atmospheric data (Phase 1 site)
+    GET /api/evaluation         Phase 1 metrics + feature importance (read-only)
+    GET /api/artifacts/<file>   whitelisted Phase 1 image artifact (read-only)
+    GET /api/scenario           Phase 1 historical test-set demonstration
+
+WHAT THE TWO MODELS MEAN (they are different things)
+----------------------------------------------------
+``/api/prediction`` -- a real thunderstorm nowcast. Its target ``target_1h`` is a
+genuine VOTV METAR present-weather observation one hour ahead. Its probability
+is a model score, NOT a confidence and NOT a calibrated thunderstorm frequency:
+the forest was trained with ``class_weight='balanced'``, which shifts scores
+towards the rare class on purpose. Only the ordering of scores and the locked
+threshold have been validated.
+
+``/api/prediction/proxy`` -- an *unrelated* surrogate. Its target is not a
+thunderstorm and not lightning; it is ``1`` when accumulated precipitation over
+the next three hours reaches a training-only 90th percentile. Its Phase 1 test
+metrics (ROC-AUC 0.8897, F1 0.4863) describe that surrogate only and must never
+be presented as thunderstorm or lightning detection accuracy, nor as an official
+IMD warning.
+
+SCIENTIFIC TERMS THIS API KEEPS STRAIGHT
+----------------------------------------
+* probability != confidence
+* latest available atmospheric data != guaranteed direct observation (the seven
+  inputs come from a model-derived provider grid cell, not the aerodrome
+  ground observation)
+* prediction != actual future thunderstorm observation (the observation for hour
+  t + 1 h does not exist at prediction time, and the payload says so explicitly)
 
 Data handling guarantees
 ------------------------
-* No weather value is ever invented, imputed or defaulted. If Open-Meteo is
-  unreachable, malformed, returns unexpected units, or lacks recent usable
-  observations, the endpoint fails with HTTP 503 and a descriptive JSON error.
-* The model predicts for the latest hourly timestamp that is at or before the
-  current UTC time. Hours after that instant are ignored, so no future weather
-  value is used to build features.
+* No weather value and no prediction is ever invented, imputed, defaulted or
+  carried over from a previous request.
+* A failure never returns a probability. Both endpoints answer with a JSON error
+  body whose prediction fields are explicitly ``null``.
+* The model bundle is read once per process (the artifact is ~144 MB) and is
+  only ever read, never written.
 
 Usage
 -----
@@ -38,9 +70,10 @@ Usage
     flask --app app run
 
 Environment variables (all optional):
-    HOST              bind address (default 127.0.0.1)
-    PORT              bind port (default 5000)
-    FLASK_DEBUG       "1" to enable the debug reloader (default off)
+    HOST                  bind address (default 127.0.0.1)
+    PORT                  bind port (default 5000)
+    FLASK_DEBUG           "1" to enable the debug reloader (default off)
+    CORS_ALLOWED_ORIGINS  comma-separated origin allow-list, or "*" (default)
 """
 
 from __future__ import annotations
@@ -56,14 +89,21 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import requests
-from flask import Flask, jsonify, render_template, send_file
+from flask import Flask, jsonify, render_template, request, send_file
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-# Reuse the verified Phase 1 inference entry point and its feature engineering.
-# Nothing in ml/ is modified by this module.
+# --------------------------------------------------------------------------
+# Phase 8: the primary product. The prediction engine is imported through the
+# Phase 8 service layer, which owns the one-time model load and the
+# engine-error -> HTTP translation. Nothing in ml/ is modified by this module.
+# --------------------------------------------------------------------------
+from backend import nowcast_service  # noqa: E402
+from ml.predict_thunderstorm_nowcast import (  # noqa: E402
+    ThunderstormNowcastError,
+)
 from ml.predict import (  # noqa: E402
     DISCLAIMER as SURROGATE_TARGET_DISCLAIMER,
     MIN_HISTORY_ROWS,
@@ -79,6 +119,20 @@ from ml import train_model as phase1  # noqa: E402
 # --------------------------------------------------------------------------
 # Configuration
 # --------------------------------------------------------------------------
+
+#: Origin allow-list for the read-only API. This is a local prototype with no
+#: authentication, no cookies and no write endpoints, so "*" is a defensible
+#: default; set CORS_ALLOWED_ORIGINS to a comma-separated list to restrict it.
+CORS_ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("CORS_ALLOWED_ORIGINS", "*").split(",")
+    if origin.strip()
+]
+
+#: Header value used for ``Access-Control-Allow-Origin``. ``*`` cannot be
+#: combined with credentials, and this API never uses them, so the wildcard is
+#: only ever emitted for the "allow everything" configuration.
+CORS_ALLOW_ANY_ORIGIN = CORS_ALLOWED_ORIGINS == ["*"]
 
 TARGET_LOCATION = {
     "location": "Thiruvananthapuram, Kerala",
@@ -211,6 +265,11 @@ app = Flask(__name__)
 
 #: Loaded once at import time. ``load_error`` keeps the failure reason so
 #: /api/health can report it and /api/prediction can refuse to serve.
+#:
+#: ``_MODEL`` is the Phase 1 surrogate proxy (legacy, served at
+#: /api/prediction/proxy). The Phase 8 primary model -- the Phase 6 1-hour
+#: thunderstorm nowcast bundle -- is owned by ``backend.nowcast_service`` and
+#: loaded once there.
 _MODEL: Any = None
 _METADATA: dict[str, Any] | None = None
 _LOAD_ERROR: str | None = None
@@ -239,6 +298,13 @@ def _load_evaluation() -> None:
 
 _load_model()
 _load_evaluation()
+
+#: Phase 8: load the primary (Phase 6 nowcast) bundle once, at import, so the
+#: very first /api/health or /api/prediction call does not pay the ~144 MB read.
+#: A failure is recorded inside the service layer and reported by /api/health;
+#: it never stops the application from starting, and it never yields a
+#: substituted prediction.
+nowcast_service.warm_up()
 
 
 def load_evaluation_report() -> dict[str, Any]:
@@ -913,6 +979,8 @@ def _error_response(error: Exception):
                 "predicted_class": None,
                 "probability": None,
                 "risk_label": None,
+                "threshold": None,
+                "no_prediction_produced": True,
                 "note": (
                     "No prediction was produced. No weather or prediction value "
                     "has been fabricated."
@@ -922,6 +990,49 @@ def _error_response(error: Exception):
         ),
         503,
     )
+
+
+# --------------------------------------------------------------------------
+# Cross-origin access and response hardening
+# --------------------------------------------------------------------------
+
+#: API responses are never cacheable. A cached prediction would be presented as
+#: current while describing an hour that has already passed, which is exactly
+#: the failure mode the freshness policy exists to prevent.
+_NO_STORE_PATHS_PREFIXES = ("/api/",)
+
+
+@app.after_request
+def _apply_response_headers(response):
+    """Attach CORS and hardening headers to every response.
+
+    Implemented directly rather than by adding ``flask-cors``: the requirement
+    is a fixed, read-only header set on a local prototype, and keeping the
+    dependency list unchanged is worth more here than the library.
+    """
+    origin = request.headers.get("Origin")
+    if origin:
+        if CORS_ALLOW_ANY_ORIGIN or origin in CORS_ALLOWED_ORIGINS:
+            response.headers["Access-Control-Allow-Origin"] = origin if not CORS_ALLOW_ANY_ORIGIN else "*"
+            # The response varies by Origin once a specific origin is echoed.
+            response.headers.add("Vary", "Origin")
+    elif CORS_ALLOW_ANY_ORIGIN:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+
+    # Read-only surface: only these methods are advertised, so a preflight for
+    # POST/PUT/DELETE cannot succeed.
+    response.headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Accept, Content-Type"
+    response.headers["Access-Control-Max-Age"] = "600"
+
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Referrer-Policy"] = "no-referrer"
+
+    if request.path.startswith(_NO_STORE_PATHS_PREFIXES):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
+        response.headers["Pragma"] = "no-cache"
+
+    return response
 
 
 # --------------------------------------------------------------------------
@@ -948,33 +1059,94 @@ def dashboard():
 
 @app.route("/api/health")
 def api_health():
-    """Report application status, model status, target location and feature count."""
-    model_loaded = _MODEL is not None and _METADATA is not None
-    payload = {
-        "status": "ok" if model_loaded else "degraded",
-        "application": "SIH 2026 high-precipitation risk proxy -- prediction backend",
-        "phase": "Phase 2 (Flask backend)",
-        "proxy_name": PROXY_NAME,
-        "model_loaded": model_loaded,
-        "model_error": _LOAD_ERROR,
+    """Phase 8 health check: application, primary model, engine, live data.
+
+    Four things are actually verified rather than assumed:
+
+    * the application is running -- it answered this request;
+    * the primary model is available -- the Phase 6 nowcast bundle is loaded
+      (the Phase 7 loader re-validates feature order, threshold, lead time and
+      target against the metadata before returning it);
+    * the prediction engine is available -- the Phase 7 callable exists and the
+      Phase 4 feature module it depends on imports and yields 28 features;
+    * the live-data dependency is reachable -- an explicit, bounded request to
+      Open-Meteo. Pass ``?live=0`` to skip that probe when offline.
+
+    ``status`` is ``ok`` when all of the above hold, ``degraded`` when the model
+    and engine work but the live provider is unreachable (a prediction request
+    would currently fail with 503), and ``unavailable`` when no prediction can
+    be served at all. HTTP 200 is returned only for ``ok``; everything else is
+    503, so a monitor that only reads the status code still sees the problem.
+    The body always states which check failed.
+    """
+    probe_upstream = request.args.get("live", "1").lower() not in ("0", "false", "no")
+    snapshot = nowcast_service.health_snapshot(probe_upstream=probe_upstream)
+
+    # The legacy Phase 1 surrogate proxy is reported separately, so its status
+    # can never be confused with the health of the thunderstorm nowcast.
+    proxy_loaded = _MODEL is not None and _METADATA is not None
+    snapshot["legacy_proxy_model"] = {
+        "available": proxy_loaded,
+        "error": _LOAD_ERROR,
         "model_type": (_METADATA or {}).get("model_type"),
-        "model_feature_count": (_METADATA or {}).get("n_features"),
-        "target_location": {
-            "location": TARGET_LOCATION["location"],
-            "latitude": TARGET_LOCATION["latitude"],
-            "longitude": TARGET_LOCATION["longitude"],
-        },
-        "risk_labels": {str(key): value for key, value in RISK_LABELS.items()},
-        "weather_provider": "Open-Meteo forecast API",
-        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "disclaimer": DISCLAIMER_TEXT,
+        "feature_count": (_METADATA or {}).get("n_features"),
+        "target": "high-precipitation risk proxy (surrogate, NOT a thunderstorm label)",
+        "served_at": "/api/prediction/proxy",
+        "note": (
+            "Reported for completeness only. The health of this surrogate model "
+            "does not affect the thunderstorm nowcast served at /api/prediction."
+        ),
     }
-    return jsonify(payload), (200 if model_loaded else 503)
+    snapshot["live_probe_performed"] = probe_upstream
+
+    status_code = 200 if snapshot["status"] == "ok" else 503
+    return jsonify(snapshot), status_code
 
 
 @app.route("/api/prediction")
 def api_prediction():
-    """Fetch live weather and return the model's risk proxy for the next 3 hours."""
+    """Phase 8 primary endpoint: a real 1-hour thunderstorm nowcast.
+
+    The response is the Phase 7 engine payload (``probability``,
+    ``predicted_class``, ``risk_label``, ``threshold``, ``lead_time_hours``,
+    ``prediction_timestamp``, ``feature_timestamp``, ``source.provenance`` with
+    the served grid cell, the model identifier and ``feature_completeness``),
+    wrapped in a thin API envelope. This module performs no inference itself.
+
+    If the live atmospheric data cannot be obtained -- provider unreachable,
+    unexpected units, a missing variable, no contiguous usable window, data
+    older than the freshness limit -- the Phase 7 engine refuses and this
+    endpoint answers with a JSON error whose prediction fields are ``null``.
+    No value is ever substituted, and an error must never be read as "no
+    thunderstorm".
+    """
+    try:
+        return jsonify(nowcast_service.live_nowcast()), 200
+    except ThunderstormNowcastError as error:
+        return (
+            jsonify(nowcast_service.engine_error_payload(error)),
+            nowcast_service.http_status_for_engine_error(error.code),
+        )
+    except Exception as error:  # noqa: BLE001 - never leak an HTML 500 traceback
+        payload = nowcast_service.engine_error_payload(
+            ThunderstormNowcastError(
+                "internal_error",
+                "The prediction endpoint failed unexpectedly. No prediction has "
+                "been fabricated.",
+                f"{type(error).__name__}: {error}",
+            )
+        )
+        return jsonify(payload), 500
+
+
+@app.route("/api/prediction/proxy")
+def api_prediction_proxy():
+    """Phase 2 endpoint, retained: the Phase 1 surrogate risk proxy.
+
+    Unchanged from Phase 2. Its target is a high-precipitation proxy, NOT a
+    thunderstorm or lightning label, and it is a different product from
+    ``/api/prediction``.
+    """
     try:
         return jsonify(build_prediction()), 200
     except (OpenMeteoError, ModelUnavailableError) as error:
@@ -1180,13 +1352,66 @@ def not_found(_error):
     )
 
 
+@app.errorhandler(405)
+def method_not_allowed(_error):
+    """JSON 405: this API surface is read-only (GET/HEAD/OPTIONS)."""
+    return (
+        jsonify(
+            {
+                "error": True,
+                "status": "error",
+                "code": "method_not_allowed",
+                "message": "This endpoint is read-only; use GET.",
+            }
+        ),
+        405,
+    )
+
+
+@app.errorhandler(500)
+def internal_error(_error):
+    """JSON 500 that never leaks a traceback, and never implies a prediction."""
+    return (
+        jsonify(
+            {
+                "error": True,
+                "status": "error",
+                "code": "internal_error",
+                "message": "The server hit an unexpected error. No prediction has been fabricated.",
+                "probability": None,
+                "predicted_class": None,
+                "risk_label": None,
+                "no_prediction_produced": True,
+            }
+        ),
+        500,
+    )
+
+
 def main() -> int:
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "5000"))
     debug = os.environ.get("FLASK_DEBUG", "0") == "1"
 
-    print(f"Model loaded: {_MODEL is not None}" + (f" ({_LOAD_ERROR})" if _LOAD_ERROR else ""))
+    # Report the Phase 8 primary model and the retained Phase 2 surrogate
+    # separately, so the startup log cannot be misread as one model.
+    nowcast_ok = nowcast_service.model_available()
+    print(
+        f"[primary ] thunderstorm nowcast (Phase 6/7) loaded: {nowcast_ok}"
+        + (
+            ""
+            if nowcast_ok
+            else f" -- /api/prediction will refuse to serve"
+        )
+    )
+    print(
+        f"[legacy  ] high-precipitation proxy (Phase 1) loaded: {_MODEL is not None}"
+        + (f" ({_LOAD_ERROR})" if _LOAD_ERROR else "")
+    )
     print(f"Serving on http://{host}:{port}/")
+    print(f"  GET /                dashboard")
+    print(f"  GET /api/health      health (add ?live=0 to skip the provider probe)")
+    print(f"  GET /api/prediction  1-hour thunderstorm nowcast (Phase 7 engine)")
     app.run(host=host, port=port, debug=debug)
     return 0
 

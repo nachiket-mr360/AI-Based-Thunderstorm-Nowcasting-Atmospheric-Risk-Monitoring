@@ -1,12 +1,12 @@
 /* ==========================================================================
    SIH 2026 dashboard front-end.
    Vanilla JavaScript, no build step. Talks only to the existing Flask API:
-     GET /api/prediction   live weather + model inference (source of truth)
+     GET /api/prediction   Phase 7 1-hour thunderstorm nowcast (source of truth)
      GET /api/history      latest available real hourly atmospheric data (trend charts)
      GET /api/evaluation   Phase 1 metrics + feature importance (read-only)
      GET /api/health       model status
    No prediction value is computed or defaulted in the browser, and nothing is
-   persisted to storage.
+   persisted to storage. Probability is a model score, not confidence.
    ========================================================================== */
 
 (function () {
@@ -182,12 +182,20 @@
       bar.style.width = Math.max(0, Math.min(100, data.probability * 100)).toFixed(2) + "%";
     }
 
-    setText("observation-timestamp", formatUtc(data.observation_timestamp_utc));
+    var featureTs = data.feature_timestamp || data.observation_timestamp_utc;
+    setText("observation-timestamp", formatUtc(featureTs));
 
     var model = data.model || {};
-    setText("threshold", isNum(model.decision_threshold_mm_per_3h)
-      ? model.decision_threshold_mm_per_3h + " mm / 3 h"
-      : EMPTY);
+    if (isNum(data.threshold)) {
+      setText("threshold", Number(data.threshold).toFixed(4));
+    } else if (isNum(model.decision_threshold)) {
+      setText("threshold", Number(model.decision_threshold).toFixed(4));
+    } else if (isNum(model.decision_threshold_mm_per_3h)) {
+      // Legacy surrogate proxy field only (retained at /api/prediction/proxy).
+      setText("threshold", model.decision_threshold_mm_per_3h + " mm / 3 h");
+    } else {
+      setText("threshold", EMPTY);
+    }
   }
 
   function renderConditions(data) {
@@ -195,7 +203,7 @@
     if (!grid) { return; }
     grid.innerHTML = "";
 
-    var weather = data.current_weather || {};
+    var weather = data.current_weather || data.input_atmospheric_conditions || {};
     CONDITION_FIELDS.forEach(function (field) {
       var entry = weather[field.key] || {};
       var wrapper = document.createElement("div");
@@ -223,7 +231,8 @@
       grid.appendChild(wrapper);
     });
 
-    setText("conditions-note", "Data timestamp " + formatUtc(data.observation_timestamp_utc) + " UTC");
+    var featureTs = data.feature_timestamp || data.observation_timestamp_utc;
+    setText("conditions-note", "Feature hour " + formatUtc(featureTs) + " UTC (latest available atmospheric data)");
   }
 
   /* --------------------------------- map ---------------------------------- */

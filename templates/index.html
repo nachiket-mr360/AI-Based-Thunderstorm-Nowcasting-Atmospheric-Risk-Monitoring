@@ -48,31 +48,31 @@
     <!-- ================= 2. MAIN RISK CARD ================= -->
     <section class="card risk-card" aria-live="polite">
       <div class="risk-head">
-        <h2>AI High-Precipitation Risk Proxy</h2>
+        <h2>1-Hour Thunderstorm Nowcast</h2>
         <span class="risk-head-tags">
           <span class="mode-chip mode-live">Live Mode</span>
-          <span class="chip">3-Hour Atmospheric Risk Estimate</span>
+          <span class="chip">VOTV &middot; Lead time 1 hour</span>
         </span>
       </div>
 
       <div class="risk-body">
         <div class="risk-primary">
           <span id="risk-label" class="risk-label risk-label-empty">&mdash;</span>
-          <span class="risk-sublabel">Current risk classification</span>
+          <span class="risk-sublabel">Nowcast alert (probability vs locked threshold 0.0775)</span>
         </div>
 
         <div class="risk-secondary">
           <div class="risk-stat">
-            <span class="stat-label">Model probability (Elevated Risk class)</span>
+            <span class="stat-label">Model probability (thunderstorm class)</span>
             <span id="probability" class="stat-value">&mdash;</span>
             <div class="prob-track"><div id="probability-bar" class="prob-fill"></div></div>
           </div>
           <div class="risk-stat">
             <span class="stat-label">Prediction horizon</span>
-            <span class="stat-value stat-value-sm">Next 3 Hours</span>
+            <span class="stat-value stat-value-sm">Next 1 Hour</span>
           </div>
           <div class="risk-stat">
-            <span class="stat-label">Data timestamp (UTC)</span>
+            <span class="stat-label">Feature hour (UTC)</span>
             <span id="observation-timestamp" class="stat-value stat-value-sm">&mdash;</span>
           </div>
           <div class="risk-stat">
@@ -83,9 +83,10 @@
       </div>
 
       <p class="footnote">
-        The probability above is the model's output for the Elevated Risk class. It is not a
-        measure of model accuracy or confidence, and it is not a thunderstorm or lightning
-        probability.
+        The probability above is the Phase&nbsp;7 model score for a thunderstorm at VOTV in the
+        next clock hour. It is <strong>not</strong> confidence, not a calibrated thunderstorm
+        frequency, and not an observed future outcome. Live inputs are latest available
+        atmospheric data from the provider grid cell, not the aerodrome ground observation.
       </p>
     </section>
 
