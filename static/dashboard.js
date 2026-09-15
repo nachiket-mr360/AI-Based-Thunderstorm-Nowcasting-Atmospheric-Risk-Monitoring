@@ -192,7 +192,7 @@
       label.className = "risk-label risk-label-empty";
     }
     var card = el("risk-section");
-    if (card) { card.className = "card risk-card"; }
+    if (card) { card.className = "card risk-card hero"; }
 
     [
       "probability", "lead-time", "threshold", "feature-timestamp",
@@ -213,6 +213,19 @@
     clearRiskMarkers();
     setText("map-mode-note", "Point / location-based risk");
     setText("spatial-capability", "Single validated point (not a forecast grid)");
+    setThresholdMarker(LOCKED_THRESHOLD);
+  }
+
+  /* Hero threshold tick: marks the locked decision threshold on the probability
+     bar. Position comes from the API value; nothing here is invented. */
+  function setThresholdMarker(thresholdValue) {
+    var mark = el("prob-threshold-mark");
+    if (mark && isNum(thresholdValue)) {
+      mark.style.left = Math.max(0, Math.min(100, thresholdValue * 100)).toFixed(3) + "%";
+      mark.title = "Locked decision threshold " + thresholdValue.toFixed(4);
+    }
+    setText("prob-threshold-mark-label",
+      isNum(thresholdValue) ? thresholdValue.toFixed(4) : EMPTY);
   }
 
   /* ------------------------------ risk card ------------------------------ */
@@ -226,7 +239,7 @@
     }
     var card = el("risk-section");
     if (card) {
-      card.className = "card risk-card " + (elevated ? "is-elevated" : "is-low");
+      card.className = "card risk-card hero " + (elevated ? "is-elevated" : "is-low");
     }
 
     setText("probability",
@@ -243,11 +256,11 @@
         ? "1 hour"
         : (isNum(lead) ? lead + " hour" + (lead === 1 ? "" : "s") : EMPTY));
 
-    if (isNum(data.threshold)) {
-      setText("threshold", Number(data.threshold).toFixed(4));
-    } else {
-      setText("threshold", LOCKED_THRESHOLD.toFixed(4));
-    }
+    var thresholdValue = isNum(data.threshold)
+      ? Number(data.threshold)
+      : LOCKED_THRESHOLD;
+    setText("threshold", thresholdValue.toFixed(4));
+    setThresholdMarker(thresholdValue);
 
     setText("feature-timestamp", formatUtc(data.feature_timestamp || data.observation_timestamp_utc));
     setText("prediction-timestamp", formatUtc(data.prediction_timestamp));
@@ -456,16 +469,19 @@
       attributionControl: true
     });
 
-    // CARTO basemap (OSM-derived). The public tile.openstreetmap.org endpoint
-    // returns HTTP 403 for many browser clients; CARTO does not require an API key
-    // for light demo use and keeps correct OSM + CARTO attribution.
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png", {
-      maxZoom: 19,
-      subdomains: "abcd",
-      attribution:
-        '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> ' +
-        'contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-    }).addTo(map);
+    // Esri World Street Map basemap. Key-free: the ArcGIS REST tile endpoint
+    // serves these tiles without any API key, token or referer allow-list.
+    // NOTE the Esri path order is {z}/{y}/{x}, not {z}/{x}/{y}.
+    L.tileLayer(
+      "https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}",
+      {
+        maxZoom: 19,
+        attribution:
+          'Tiles &copy; Esri &mdash; Source: Esri, DeLorme, NAVTEQ, USGS, Intermap, ' +
+          'iPC, NRCAN, Esri Japan, METI, Esri China (Hong Kong), Esri (Thailand), ' +
+          'TomTom, 2012'
+      }
+    ).addTo(map);
 
     // Empty risk layer ready for 1..N real prediction points.
     mapState.riskLayer = L.featureGroup().addTo(map);
