@@ -60,8 +60,14 @@ Data handling guarantees
   carried over from a previous request.
 * A failure never returns a probability. Both endpoints answer with a JSON error
   body whose prediction fields are explicitly ``null``.
-* The model bundle is read once per process (the artifact is ~144 MB) and is
-  only ever read, never written.
+* The primary 1-hour nowcast bundle is read once per process at startup (the
+  artifact is ~144 MB) and is only ever read, never written.
+* The legacy Phase 1 surrogate bundle is read **lazily**, on the first request
+  that actually needs it (``/api/prediction/proxy``, ``/api/scenario``). Its
+  artifact is ~130 MB on disk but ~440 MB once resident, so loading it at
+  import would make one process hold both forests simultaneously and exceed a
+  512 MiB hosting instance. See ``ensure_legacy_model`` for the deployment
+  consequence.
 
 Usage
 -----
@@ -265,28 +271,101 @@ class ModelUnavailableError(Exception):
 
 app = Flask(__name__)
 
-#: Loaded once at import time. ``load_error`` keeps the failure reason so
-#: /api/health can report it and /api/prediction can refuse to serve.
+#: ``load_error`` keeps the failure reason so /api/health can report it and
+#: /api/prediction can refuse to serve.
 #:
 #: ``_MODEL`` is the Phase 1 surrogate proxy (legacy, served at
 #: /api/prediction/proxy). The Phase 8 primary model -- the Phase 6 1-hour
 #: thunderstorm nowcast bundle -- is owned by ``backend.nowcast_service`` and
-#: loaded once there.
+#: loaded once there, at import.
+#:
+#: DEPLOYMENT NOTE (512 MiB hosts): the legacy surrogate bundle is deliberately
+#: NOT loaded at import. It is not used by the primary dashboard, which calls
+#: only /api/prediction, /api/history and /api/evaluation. Nothing about the
+#: endpoint changes -- only *when* the artifact is read.
 _MODEL: Any = None
 _METADATA: dict[str, Any] | None = None
 _LOAD_ERROR: str | None = None
 _EVALUATION: dict[str, Any] | None = None
 
+#: Guards the lazy legacy load. ``_MODEL_ATTEMPTED`` makes the load single-shot:
+#: a failure is recorded once and re-reported on every later call rather than
+#: being retried, so a broken artifact stays visibly broken.
+_MODEL_LOCK = threading.Lock()
+_MODEL_ATTEMPTED = False
+
+#: Cached `models/model_metadata.json` contents, used only so /api/health can
+#: report the legacy model type and feature count while the bundle is unloaded.
+_LEGACY_METADATA_PREVIEW: dict[str, Any] | None = None
+
+#: Names of the legacy Phase 1 artifacts, used only to answer "can this endpoint
+#: serve?" without reading ~130 MB into memory.
+PROXY_MODEL_FILENAME = "storm_risk_model.joblib"
+PROXY_METADATA_FILENAME = "model_metadata.json"
+
 
 def _load_model() -> None:
     """Load the Phase 1 artifacts exactly once, recording any failure."""
-    global _MODEL, _METADATA, _LOAD_ERROR
+    global _MODEL, _METADATA, _LOAD_ERROR, _MODEL_ATTEMPTED
+    _MODEL_ATTEMPTED = True
     try:
         _MODEL, _METADATA = load_artifacts(MODELS_DIR)
         _LOAD_ERROR = None
     except Exception as exc:  # noqa: BLE001 - surfaced through /api/health
         _MODEL, _METADATA = None, None
         _LOAD_ERROR = f"{type(exc).__name__}: {exc}"
+
+
+def ensure_legacy_model() -> None:
+    """Load the legacy Phase 1 surrogate bundle on first use, at most once.
+
+    The lock makes the load single-flight, and ``_MODEL_ATTEMPTED`` makes it
+    single-shot, so concurrent first requests produce one read rather than N.
+
+    Deployment consequence (documented deliberately): the first request to
+    ``/api/prediction/proxy`` or ``/api/scenario`` pays the artifact read and
+    the ~440 MB resident cost, and that memory then stays resident for the life
+    of the process, exactly as it did when the load happened at import. Every
+    other endpoint -- including the whole primary dashboard -- never triggers
+    it.
+    """
+    if _MODEL_ATTEMPTED:
+        return
+    with _MODEL_LOCK:
+        if _MODEL_ATTEMPTED:
+            return
+        _load_model()
+
+
+def legacy_artifacts_present() -> bool:
+    """True when both legacy Phase 1 artifact files exist, without reading them."""
+    return (MODELS_DIR / PROXY_MODEL_FILENAME).is_file() and (
+        MODELS_DIR / PROXY_METADATA_FILENAME
+    ).is_file()
+
+
+def legacy_metadata_preview() -> dict[str, Any]:
+    """Read the small legacy metadata JSON without reading the ~130 MB model.
+
+    /api/health reports the legacy model type and feature count. Those two
+    values live in `models/model_metadata.json` (a few KB), so they can be
+    reported truthfully while the bundle itself stays unloaded. Returns an
+    empty mapping if the file is unreadable.
+    """
+    global _LEGACY_METADATA_PREVIEW
+    if _LEGACY_METADATA_PREVIEW is None:
+        try:
+            _LEGACY_METADATA_PREVIEW = json.loads(
+                (MODELS_DIR / PROXY_METADATA_FILENAME).read_text(encoding="utf-8")
+            )
+        except Exception:  # noqa: BLE001 - reported as missing values, never fatal
+            _LEGACY_METADATA_PREVIEW = {}
+    return _LEGACY_METADATA_PREVIEW
+
+
+def legacy_model_loaded() -> bool:
+    """True when the legacy Phase 1 bundle is resident in memory."""
+    return _MODEL is not None and _METADATA is not None
 
 
 def _load_evaluation() -> None:
@@ -298,7 +377,9 @@ def _load_evaluation() -> None:
         _EVALUATION = None
 
 
-_load_model()
+#: The legacy surrogate bundle is intentionally not loaded here; see
+#: ``ensure_legacy_model``. Only its (cheap) CSV-shaped evaluation metadata is
+#: read at import.
 _load_evaluation()
 
 #: Phase 8: load the primary (Phase 6 nowcast) bundle once, at import, so the
@@ -589,7 +670,13 @@ def compute_historical_scenario() -> dict[str, Any]:
 
 
 def require_model() -> tuple[Any, dict[str, Any]]:
-    """Return the loaded model and metadata, or raise ``ModelUnavailableError``."""
+    """Return the loaded model and metadata, or raise ``ModelUnavailableError``.
+
+    This is the only entry point to the legacy bundle: it triggers the deferred
+    load on first use and then behaves exactly as it did when the load was
+    eager.
+    """
+    ensure_legacy_model()
     if _MODEL is None or _METADATA is None:
         raise ModelUnavailableError(
             _LOAD_ERROR or "Model artifacts are not available in models/."
@@ -1096,12 +1183,24 @@ def api_health():
 
     # The legacy Phase 1 surrogate proxy is reported separately, so its status
     # can never be confused with the health of the thunderstorm nowcast.
-    proxy_loaded = _MODEL is not None and _METADATA is not None
+    #
+    # A health probe is deliberately NOT allowed to trigger the lazy load: a
+    # monitor polling this endpoint would otherwise pull ~440 MB into memory
+    # just by looking. ``available`` therefore reports whether the endpoint can
+    # serve (its artifacts are present), and ``loaded_into_memory`` reports
+    # whether the bundle happens to be resident right now.
+    proxy_loaded = legacy_model_loaded()
+    proxy_metadata = _METADATA or legacy_metadata_preview()
     snapshot["legacy_proxy_model"] = {
-        "available": proxy_loaded,
+        "available": legacy_artifacts_present(),
+        "loaded_into_memory": proxy_loaded,
+        "load_policy": (
+            "lazy: the bundle is read on the first request to "
+            "/api/prediction/proxy or /api/scenario, never at import"
+        ),
         "error": _LOAD_ERROR,
-        "model_type": (_METADATA or {}).get("model_type"),
-        "feature_count": (_METADATA or {}).get("n_features"),
+        "model_type": proxy_metadata.get("model_type"),
+        "feature_count": proxy_metadata.get("n_features"),
         "target": "high-precipitation risk proxy (surrogate, NOT a thunderstorm label)",
         "served_at": "/api/prediction/proxy",
         "note": (
@@ -1417,7 +1516,9 @@ def main() -> int:
         )
     )
     print(
-        f"[legacy  ] high-precipitation proxy (Phase 1) loaded: {_MODEL is not None}"
+        "[legacy  ] high-precipitation proxy (Phase 1) artifacts present: "
+        f"{legacy_artifacts_present()} (loaded lazily, on first use of "
+        "/api/prediction/proxy or /api/scenario)"
         + (f" ({_LOAD_ERROR})" if _LOAD_ERROR else "")
     )
     print(f"Serving on http://{host}:{port}/")
